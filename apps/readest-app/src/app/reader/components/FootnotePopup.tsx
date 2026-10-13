@@ -218,7 +218,7 @@ const FootnotePopup: React.FC<FootnotePopupProps> = ({
           height: clipPopupHeight(Math.max(popupWidth, window.innerHeight / 4)),
         }
       : {
-          width: clipPopupWith(Math.max(popupWidth, window.innerWidth / 4)),
+          width: clipPopupWith(window.innerWidth),
           height: clipPopupHeight(popupHeight),
         };
     setResponsiveWidth(size.width);
