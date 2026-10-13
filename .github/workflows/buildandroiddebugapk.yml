@@ -1,73 +1,154 @@
-name: Build Android Debug APK
+# Android-only build. Mirrors the android leg of nightly-readest.yml.
+# Removed: the linux/macos/windows matrix legs, CEF/portable/AppImage steps,
+# rclone + R2 upload, manifest assembly, prune, and the KOReader plugin job.
+# Also removed: the Tauri updater .sig signing (no in-app updater for this build).
+name: Build Android APK
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-readest
+  cancel-in-progress: false
+
 jobs:
-  build-android:
+  compute-version:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    outputs:
+      nightly_version: ${{ steps.v.outputs.nightly_version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          ref: main
+          persist-credentials: false
+      - id: v
+        run: |
+          BASE=$(node -p "require('./apps/readest-app/package.json').version")
+          STAMP=$(TZ=Asia/Shanghai date +%Y%m%d%H)
+          echo "nightly_version=${BASE}-${STAMP}" >> "$GITHUB_OUTPUT"
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+  build:
+    needs: compute-version
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          version: 9
+          ref: main
+          persist-credentials: false
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: initialize git submodules
+        run: git submodule update --init --recursive
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: setup node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: 24
           cache: pnpm
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - name: setup Java (for Android build only)
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
         with:
           distribution: 'zulu'
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: setup Android SDK (for Android build only)
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
         with:
+          # The legacy `tools` package (part of the action's default) no longer
+          # exists in the SDK repository and makes sdkmanager fail.
           packages: 'platform-tools'
 
-      - name: Install NDK
+      - name: install NDK (for Android build only)
         run: sdkmanager "ndk;28.2.13676358"
 
-      - name: Install dependencies
+      - name: install dependencies
         run: pnpm install --frozen-lockfile --prefer-offline
 
-      - name: Copy vendors
+      - name: copy pdfjs-dist and simplecc-dist to public directory
         run: pnpm --filter @readest/readest-app setup-vendors
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
 
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
-          key: android-debug
+          key: nightly-ubuntu-latest-android-cargo
 
-      - name: Build Android APK (debug)
-        working-directory: apps/readest-app
+      - name: create .env.local file for Next.js
+        run: |
+          cat > .env.local <<'EOF'
+          NEXT_PUBLIC_POSTHOG_KEY=phc_placeholder
+          NEXT_PUBLIC_POSTHOG_HOST=https://placeholder
+          NEXT_PUBLIC_SUPABASE_URL=https://placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY=placeholder-anon-key
+          NEXT_PUBLIC_APP_PLATFORM=tauri
+          SENTRY_DSN=https://placeholder@placeholder.ingest.sentry.io/0
+          SENTRY_AUTH_TOKEN=
+          SENTRY_ORG=readest
+          SENTRY_PROJECT=readest
+          EOF
+          cp .env.local apps/readest-app/.env.local
+
+      # ──────────────────────────── ANDROID ────────────────────────────
+      # `pnpm tauri android init` + `git checkout .` reverts tracked files
+      # (including package.json), so the nightly version MUST be patched AFTER
+      # the checkout. Mirrors release.yml's android build/signing steps.
+      - name: build and sign Android apks
+        shell: bash
+        # Two full Android builds (universal + arm64) run ~50-60min and sometimes
+        # exceed 75. Stays under the job backstop above.
+        timeout-minutes: 90
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
         run: |
+          version="${{ needs.compute-version.outputs.nightly_version }}"
+          cd apps/readest-app/
           rm -rf src-tauri/gen/android
           pnpm tauri android init
           pnpm tauri icon ../../data/icons/readest-book.png
           git checkout .
-          pnpm tauri android build --debug
+          # Patch the nightly version AFTER checkout so the stamp survives.
+          node -e "const f='package.json';const j=require('./'+f);j.version='${version}';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
 
-      - name: Upload APK
+          pushd src-tauri/gen/android
+          echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+          echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+          base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > $RUNNER_TEMP/keystore.jks
+          echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+          popd
+
+          apk_path=src-tauri/gen/android/app/build/outputs/apk/universal/release
+          universal_apk=Readest_${version}_universal.apk
+          arm64_apk=Readest_${version}_arm64.apk
+          pnpm tauri android build
+          cp ${apk_path}/app-universal-release.apk $universal_apk
+          pnpm tauri android build -t aarch64
+          cp ${apk_path}/app-universal-release.apk $arm64_apk
+
+          # Sentry symbolicates Rust panics from these: the APK ships the
+          # library stripped (see gen/android/app/build.gradle.kts), while
+          # `target/` keeps the unstripped copy. Crash reporting must never
+          # fail a build, and forks have no token.
+          if [ -n "$SENTRY_AUTH_TOKEN" ]; then
+            pnpm exec sentry-cli debug-files upload --org readest --project readest \
+              ../../target/*/release/libreadestlib.so || echo "::warning::Sentry debug file upload failed"
+          fi
+
+      - name: upload Android apks
         uses: actions/upload-artifact@v4
         with:
-          name: readest-debug-apk
-          path: apps/readest-app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          name: readest-android-${{ needs.compute-version.outputs.nightly_version }}
+          path: apps/readest-app/Readest_*.apk
+          if-no-files-found: error
